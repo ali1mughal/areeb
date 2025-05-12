@@ -12,8 +12,7 @@ const discordClient = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildPresences,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.GuildMembers
     ]
 });
 
@@ -54,7 +53,8 @@ discordClient.on('presenceUpdate', async (oldPresence, newPresence) => {
         lastOnlinePlatformHandler(userId, data);
         
         if (userSubscriptions[userId]) {
-            broadcastUpdate(userId, await getFullUserData(data));
+            const fullData = await getFullUserData(userId, data);
+            broadcastUpdate(userId, fullData);
         }
     } catch (error) {
         console.error('Error in presenceUpdate:', error);
@@ -118,7 +118,8 @@ async function handleSubscription(ws, data) {
         userSubscriptions[userId].add(ws);
         
         const presence = await fetchUserPresence(userId);
-        const fullData = await getFullUserData(presence);
+        const fullData = await getFullUserData(userId, presence);
+        
         ws.send(JSON.stringify({
             type: 'initial',
             data: fullData
@@ -132,12 +133,14 @@ async function handleSubscription(ws, data) {
 
 async function fetchUserPresence(userId) {
     try {
-        // Try cache first
-        const user = discordClient.users.cache.get(userId);
-        if (user?.presence) return formatPresenceData(user.presence);
-
-        // Fallback to API
-        const response = await fetch(`https://discord.com/api/v10/users/${userId}`, {
+        // Try to get user from cache first
+        const user = await discordClient.users.fetch(userId);
+        if (user && user.presence) {
+            return formatPresenceData(user.presence);
+        }
+        
+        // Fallback to API request
+        const response = await fetch(`https://discord.com/api/v10/users/${userId}/profile`, {
             headers: { 
                 Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
                 'Content-Type': 'application/json'
@@ -151,9 +154,9 @@ async function fetchUserPresence(userId) {
         const data = await response.json();
         return {
             user: { id: userId },
-            status: data.status || 'offline',
-            client_status: data.client_status || {},
-            activities: data.activities || []
+            status: data.user.presence.status || 'offline',
+            client_status: data.user.presence.client_status || {},
+            activities: data.user.presence.activities || []
         };
 
     } catch (error) {
@@ -167,70 +170,80 @@ async function fetchUserPresence(userId) {
     }
 }
 
-async function getFullUserData(presenceData) {
-    const userId = presenceData.user.id;
+async function getFullUserData(userId, presenceData) {
     let userData = {
-        user: { id: userId },
+        user: { 
+            id: userId,
+            username: '',
+            discriminator: '',
+            avatar: null,
+            bot: false
+        },
         badges: [],
         bio: null,
         pronouns: null,
         status: 'offline',
-        activities: []
+        activities: [],
+        avatarURL: null
     };
     
     try {
-        // Check cache
-        if (userCache.has(userId)) {
-            const cached = userCache.get(userId);
-            if (Date.now() - cached.timestamp < 300000) {
-                userData = { ...userData, ...cached.data };
-            }
+        // Get basic user info
+        const discordUser = await discordClient.users.fetch(userId);
+        if (discordUser) {
+            userData.user = {
+                id: discordUser.id,
+                username: discordUser.username,
+                discriminator: discordUser.discriminator,
+                avatar: discordUser.avatar,
+                bot: discordUser.bot
+            };
+            userData.avatarURL = discordUser.displayAvatarURL({ format: 'png', dynamic: true, size: 256 });
         }
+
+        // Get profile data
+        const response = await fetch(`https://discord.com/api/v10/users/${userId}/profile`, {
+            headers: { 
+                Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+                'Content-Type': 'application/json'
+            }
+        });
         
-        // Fetch fresh data if needed
-        if (!userCache.has(userId) || Date.now() - userCache.get(userId).timestamp >= 300000) {
-            const response = await fetch(`https://discord.com/api/v10/users/${userId}/profile`, {
-                headers: { 
-                    Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
-                    'Content-Type': 'application/json'
-                }
-            });
+        if (response.ok) {
+            const profileData = await response.json();
+            userData.bio = profileData.user.bio || null;
+            userData.pronouns = profileData.user.pronouns || null;
             
-            if (response.ok) {
-                const freshData = await response.json();
-                delete freshData.mutual_guilds;
-                delete freshData.guild_badges;
-                userData = { ...userData, ...freshData };
-                
-                userCache.set(userId, {
-                    data: userData,
-                    timestamp: Date.now()
+            if (profileData.user.premium_since) {
+                userData.badges.push({
+                    id: 'premium',
+                    description: 'Nitro Subscriber',
+                    color: '#ff73fa'
                 });
             }
         }
-        
+
         // Add presence info
-        const clientStatus = presenceData.client_status || {};
-        Object.keys(clientStatus).forEach(platform => {
-            const status = clientStatus[platform] || 'offline';
-            userData.badges.push({
-                id: platform,
-                description: status === 'offline' ? 
-                    `Last online from ${capitalize(platform)}` : 
-                    `Online from ${capitalize(platform)}`,
-                status: status,
-                color: statusColors[status] || statusColors.offline
+        if (presenceData) {
+            userData.status = presenceData.status || 'offline';
+            userData.activities = presenceData.activities || [];
+            
+            const clientStatus = presenceData.client_status || {};
+            Object.keys(clientStatus).forEach(platform => {
+                const status = clientStatus[platform] || 'offline';
+                userData.badges.push({
+                    id: platform,
+                    description: status === 'offline' ? 
+                        `Last online from ${capitalize(platform)}` : 
+                        `Online from ${capitalize(platform)}`,
+                    status: status,
+                    color: statusColors[status] || statusColors.offline
+                });
             });
-        });
-        
-        userData.status = presenceData.status || 'offline';
-        userData.activities = presenceData.activities || [];
+        }
         
     } catch (error) {
-        console.error(`Error processing data for user ${userId}:`, error);
-        if (process.env.ERROR_WEBHOOK) {
-            await sendErrorToWebhook(userId, error);
-        }
+        console.error(`Error getting full data for user ${userId}:`, error);
     }
     
     return userData;
@@ -248,7 +261,12 @@ function isValidSnowflake(id) {
 async function isUserInGuild(userId) {
     try {
         for (const guild of discordClient.guilds.cache.values()) {
-            if (guild.members.cache.has(userId)) return true;
+            try {
+                await guild.members.fetch(userId);
+                return true;
+            } catch {
+                continue;
+            }
         }
         return false;
     } catch (error) {
@@ -304,25 +322,6 @@ function cleanupConnection(ws) {
                 delete userSubscriptions[userId];
             }
         }
-    }
-}
-
-async function sendErrorToWebhook(userId, error) {
-    try {
-        await fetch(process.env.ERROR_WEBHOOK, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                embeds: [{
-                    title: "Presence Tracking Error",
-                    description: `Error processing data for user <@${userId}>:\n\`\`\`${error.stack || error.message}\`\`\``,
-                    color: 0xff0000,
-                    timestamp: new Date().toISOString()
-                }]
-            })
-        });
-    } catch (webhookError) {
-        console.error('Failed to send error to webhook:', webhookError);
     }
 }
 
