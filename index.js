@@ -26,12 +26,23 @@ const config = {
     'ViewPresence',
     'ViewGuildMembers'
   ],
-  REQUIRED_INTENTS: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildPresences,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.MessageContent
+  intents: [
+                GatewayIntentBits.GuildMembers,
+                GatewayIntentBits.DirectMessages,
+                GatewayIntentBits.Guilds,
+                GatewayIntentBits.GuildVoiceStates,
+                GatewayIntentBits.GuildMessageReactions,
+                GatewayIntentBits.GuildMessages,
+                GatewayIntentBits.DirectMessages,
+                GatewayIntentBits.MessageContent,
+                GatewayIntentBits.GuildInvites,
+                GatewayIntentBits.GuildMembers,
+                GatewayIntentBits.GuildModeration,
+                GatewayIntentBits.GuildMessageReactions,
+                GatewayIntentBits.GuildEmojisAndStickers,
+                GatewayIntentBits.GuildWebhooks,
+                GatewayIntentBits.GuildVoiceStates,
+                GatewayIntentBits.MessageContent,
   ]
 };
 
