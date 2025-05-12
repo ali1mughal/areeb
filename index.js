@@ -9,8 +9,8 @@ const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const { createHash } = require('crypto');
-const PresenceManager = require('./PresenceManager.js');
-
+const PresenceManager = require('./PresenceManager'); // correct path
+const presenceManager = new PresenceManager(dataStores, config);
 
 // Configuration
 const config = {
