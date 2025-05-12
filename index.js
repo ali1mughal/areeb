@@ -136,7 +136,9 @@ async function fetchUserPresence(userId) {
         
         // Fallback to API request if not in cache
         const response = await fetch(`https://discord.com/api/v9/users/${userId}/profile`, {
-            headers: { Authorization: process.env.DISCORD_TOKEN }
+            headers: { 
+                Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` 
+            }
         });
         
         if (!response.ok) {
@@ -157,28 +159,40 @@ async function fetchUserPresence(userId) {
 
 async function getFullUserData(presenceData) {
     const userId = presenceData.user.id;
-    let userData;
+    let userData = {
+        user: { id: userId },
+        badges: [],
+        bio: null,
+        pronouns: null,
+        status: 'offline',
+        activities: []
+    };
     
     // Check cache first
     if (userCache.has(userId)) {
         const cached = userCache.get(userId);
         if (Date.now() - cached.timestamp < 300000) { // 5 minute cache
-            userData = cached.data;
+            userData = { ...userData, ...cached.data };
         }
     }
     
     // Fetch fresh data if not in cache
-    if (!userData) {
+    if (!userCache.has(userId) {
         try {
             const response = await fetch(`https://discord.com/api/v9/users/${userId}/profile`, {
-                headers: { Authorization: process.env.DISCORD_TOKEN }
+                headers: { 
+                    Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` 
+                }
             });
             
             if (response.ok) {
-                userData = await response.json();
+                const freshData = await response.json();
                 // Clean up unnecessary data
-                delete userData.mutual_guilds;
-                delete userData.guild_badges;
+                delete freshData.mutual_guilds;
+                delete freshData.guild_badges;
+                
+                // Merge with existing data
+                userData = { ...userData, ...freshData };
                 
                 // Cache the data
                 userCache.set(userId, {
@@ -188,13 +202,6 @@ async function getFullUserData(presenceData) {
             }
         } catch (error) {
             console.error(`Error fetching full profile for user ${userId}:`, error);
-            // Fallback to basic data
-            userData = {
-                user: { id: userId },
-                badges: [],
-                bio: null,
-                pronouns: null
-            };
         }
     }
     
