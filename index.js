@@ -17,7 +17,15 @@ const config = {
   PRESENCE_UPDATE_INTERVAL: 30 * 1000, // 30 seconds
   STATUS_CHECK_INTERVAL: 60 * 1000, // 1 minute
   MAX_CONNECTIONS_PER_IP: 5,
-  VERSION: '1.2.1'
+  VERSION: '1.3.0',
+  REQUIRED_PERMISSIONS: [
+    'ViewChannels',
+    'ReadMessageHistory',
+    'ViewGuildInsights',
+    'ManageWebhooks',
+    'ViewPresence',
+    'ViewGuildMembers'
+  ]
 };
 
 // Initialize Express
@@ -39,13 +47,14 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Discord Client Setup
+// Discord Client Setup with all required intents
 const discordClient = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildPresences,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.DirectMessages
+    GatewayIntentBits.GuildPresences, // Required for presence
+    GatewayIntentBits.GuildMembers,   // Required for members
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent
   ],
   partials: ['USER', 'GUILD_MEMBER', 'PRESENCE'],
   presence: {
@@ -60,6 +69,13 @@ const discordClient = new Client({
 // Server Initialization
 const server = app.listen(config.PORT, () => {
   console.log(`Server v${config.VERSION} running on http://localhost:${config.PORT}`);
+});
+
+// WebSocket Server
+const wss = new WebSocket.Server({ 
+  server,
+  clientTracking: true,
+  maxPayload: 1024 * 1024 // 1MB
 });
 
 // Data Stores
@@ -131,7 +147,13 @@ const utils = {
       throw new Error('Failed to parse message: ' + error.message);
     }
   },
-  getPlatformIcon: (platform) => statusConfig.platformIcons[platform] || statusConfig.platformIcons.mobile
+  getPlatformIcon: (platform) => statusConfig.platformIcons[platform] || statusConfig.platformIcons.mobile,
+  checkPermissions: (guild) => {
+    if (!guild) return false;
+    const permissions = guild.members.me?.permissions;
+    if (!permissions) return false;
+    return config.REQUIRED_PERMISSIONS.every(perm => permissions.has(perm));
+  }
 };
 
 // WebSocket Manager
@@ -340,35 +362,54 @@ class PresenceManager {
         return presenceData;
       }
       
-      // Fallback to API
-      const response = await fetch(`https://discord.com/api/v10/users/${userId}/profile`, {
-        headers: { 
-          Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
-          'Content-Type': 'application/json'
+      // Fallback to API with proper permission checks
+      try {
+        const guild = await this.findUserGuild(userId);
+        if (!guild || !utils.checkPermissions(guild)) {
+          throw new Error(`Missing permissions in guild ${guild?.name || 'unknown'}. Required: ${config.REQUIRED_PERMISSIONS.join(', ')}`);
         }
-      });
 
-      if (!response.ok) {
-        if (response.status === 403) {
-          throw new Error('Missing required permissions. Ensure bot has "View Presence" and "View Guild Members" permissions.');
+        const response = await fetch(`https://discord.com/api/v10/users/${userId}/profile`, {
+          headers: { 
+            Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+            'Content-Type': 'application/json'
+          }
+        });
+
+        if (!response.ok) {
+          if (response.status === 403) {
+            throw new Error(`Missing permissions. Ensure bot has:
+            - View Presence (Privileged Intent)
+            - View Guild Members (Privileged Intent)
+            And that these intents are enabled in Developer Portal`);
+          }
+          throw new Error(`API request failed: ${response.status} ${response.statusText}`);
         }
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+
+        const profileData = await response.json();
+        const presenceData = {
+          user: { id: userId },
+          status: profileData.user?.presence?.status || 'offline',
+          client_status: profileData.user?.presence?.client_status || {},
+          activities: profileData.user?.presence?.activities || []
+        };
+
+        dataStores.userCache.set(cacheKey, {
+          timestamp: Date.now(),
+          data: presenceData
+        });
+
+        return presenceData;
+      } catch (apiError) {
+        console.error(`API Error for user ${userId}:`, apiError);
+        // Return minimal offline data if API fails
+        return {
+          user: { id: userId },
+          status: 'offline',
+          client_status: dataStores.lastOnlineData[userId] || {},
+          activities: []
+        };
       }
-
-      const profileData = await response.json();
-      const presenceData = {
-        user: { id: userId },
-        status: profileData.user?.presence?.status || 'offline',
-        client_status: profileData.user?.presence?.client_status || {},
-        activities: profileData.user?.presence?.activities || []
-      };
-
-      dataStores.userCache.set(cacheKey, {
-        timestamp: Date.now(),
-        data: presenceData
-      });
-
-      return presenceData;
     } catch (error) {
       console.error(`Error fetching presence for user ${userId}:`, error);
       dataStores.connectionStats.errors++;
@@ -379,6 +420,25 @@ class PresenceManager {
         client_status: dataStores.lastOnlineData[userId] || {},
         activities: []
       };
+    }
+  }
+
+  async findUserGuild(userId) {
+    try {
+      for (const guild of discordClient.guilds.cache.values()) {
+        try {
+          await guild.members.fetch(userId);
+          if (guild.members.cache.has(userId)) {
+            return guild;
+          }
+        } catch {
+          continue;
+        }
+      }
+      return null;
+    } catch (error) {
+      console.error('Error finding user guild:', error);
+      return null;
     }
   }
 }
@@ -450,33 +510,40 @@ class UserDataManager {
         }
       }
 
-      // Get profile data
-      const response = await fetch(`https://discord.com/api/v10/users/${userId}/profile`, {
-        headers: { 
-          Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      if (response.ok) {
-        const profileData = await response.json();
-        userData.bio = profileData.user?.bio || null;
-        userData.pronouns = profileData.user?.pronouns || null;
-        userData.banner_color = profileData.user?.banner_color || null;
-        userData.premium_since = profileData.user?.premium_since || null;
-        
-        if (profileData.user?.premium_since) {
-          userData.badges.push({
-            id: 'premium',
-            description: statusConfig.badges.premium.description,
-            color: statusConfig.badges.premium.color,
-            icon: statusConfig.badges.premium.icon
+      // Get profile data if we have permissions
+      try {
+        const guild = await presenceManager.findUserGuild(userId);
+        if (guild && utils.checkPermissions(guild)) {
+          const response = await fetch(`https://discord.com/api/v10/users/${userId}/profile`, {
+            headers: { 
+              Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+              'Content-Type': 'application/json'
+            }
           });
+          
+          if (response.ok) {
+            const profileData = await response.json();
+            userData.bio = profileData.user?.bio || null;
+            userData.pronouns = profileData.user?.pronouns || null;
+            userData.banner_color = profileData.user?.banner_color || null;
+            userData.premium_since = profileData.user?.premium_since || null;
+            
+            if (profileData.user?.premium_since) {
+              userData.badges.push({
+                id: 'premium',
+                description: statusConfig.badges.premium.description,
+                color: statusConfig.badges.premium.color,
+                icon: statusConfig.badges.premium.icon
+              });
+            }
+            
+            if (profileData.user?.banner) {
+              userData.bannerURL = `https://cdn.discordapp.com/banners/${userId}/${profileData.user.banner}.png?size=512`;
+            }
+          }
         }
-        
-        if (profileData.user?.banner) {
-          userData.bannerURL = `https://cdn.discordapp.com/banners/${userId}/${profileData.user.banner}.png?size=512`;
-        }
+      } catch (profileError) {
+        console.error(`Profile fetch error for ${userId}:`, profileError);
       }
 
       // Add presence info
@@ -537,10 +604,14 @@ class SubscriptionManager {
         return;
       }
       
-      // Verify guild membership
-      const inGuild = await this.isUserInSharedGuild(userId);
-      if (!inGuild) {
+      // Verify guild membership and permissions
+      const guild = await presenceManager.findUserGuild(userId);
+      if (!guild) {
         throw new Error(`User not in any shared server. ${process.env.INVITE ? `Join our server: ${process.env.INVITE}` : ''}`);
+      }
+      
+      if (!utils.checkPermissions(guild)) {
+        throw new Error(`Bot missing required permissions in ${guild.name}. Needed: ${config.REQUIRED_PERMISSIONS.join(', ')}`);
       }
       
       // Initialize subscription
@@ -610,47 +681,13 @@ class SubscriptionManager {
       }));
     }
   }
-  
-  async isUserInSharedGuild(userId) {
-    try {
-      const guildId = process.env.GUILD_ID;
-      
-      if (guildId) {
-        const guild = discordClient.guilds.cache.get(guildId);
-        if (guild) {
-          await guild.members.fetch(userId).catch(() => null);
-          return guild.members.cache.has(userId);
-        }
-      }
-      
-      for (const guild of discordClient.guilds.cache.values()) {
-        try {
-          await guild.members.fetch(userId).catch(() => null);
-          if (guild.members.cache.has(userId)) {
-            return true;
-          }
-        } catch {
-          continue;
-        }
-      }
-      return false;
-    } catch (error) {
-      console.error('Guild check error:', error);
-      dataStores.connectionStats.errors++;
-      return false;
-    }
-  }
 }
 
 // Initialize Managers
 const presenceManager = new PresenceManager();
 const userDataManager = new UserDataManager();
 const subscriptionManager = new SubscriptionManager();
-const webSocketManager = new WebSocketManager(new WebSocket.Server({ 
-  server,
-  clientTracking: true,
-  maxPayload: 1024 * 1024 // 1MB
-}));
+const webSocketManager = new WebSocketManager(wss);
 
 // Background Tasks
 function startBackgroundTasks() {
@@ -812,12 +849,27 @@ process.on('SIGTERM', () => {
   }, 10000);
 });
 
+// Discord Client Events
+discordClient.on('ready', () => {
+  console.log(`Logged in as ${discordClient.user.tag}`);
+  console.log(`Bot is in ${discordClient.guilds.cache.size} servers:`);
+  
+  // Verify permissions in each guild
+  discordClient.guilds.cache.forEach(guild => {
+    const permissions = guild.members.me?.permissions;
+    console.log(`- ${guild.name} (${guild.id})`);
+    console.log(`  Permissions: ${permissions?.toArray().join(', ')}`);
+    
+    if (!utils.checkPermissions(guild)) {
+      console.warn(`  WARNING: Missing required permissions in ${guild.name}`);
+    }
+  });
+  
+  startBackgroundTasks();
+});
+
 // Login to Discord
 discordClient.login(process.env.DISCORD_BOT_TOKEN)
-  .then(() => {
-    console.log('Discord client logged in successfully');
-    startBackgroundTasks();
-  })
   .catch(err => {
     console.error('Login failed:', err);
     process.exit(1);
