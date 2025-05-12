@@ -1,7 +1,7 @@
 const express = require('express');
 const WebSocket = require('ws');
 const { Client, GatewayIntentBits } = require('discord.js');
-const fetch = require('node-fetch');
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 require('dotenv').config();
 
 const app = express();
