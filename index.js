@@ -17,9 +17,9 @@ const config = {
   PRESENCE_UPDATE_INTERVAL: 30 * 1000, // 30 seconds
   STATUS_CHECK_INTERVAL: 60 * 1000, // 1 minute
   MAX_CONNECTIONS_PER_IP: 5,
-  VERSION: '1.3.1',
+  VERSION: '1.4.0',
   REQUIRED_PERMISSIONS: [
-    'ViewChannels',
+    'ViewChannel',
     'ReadMessageHistory',
     'ViewGuildInsights',
     'ManageWebhooks',
@@ -158,14 +158,14 @@ const utils = {
   },
   generateBotInvite: () => {
     const permissions = new PermissionsBitField()
-      .add('ViewChannels')
-      .add('ReadMessageHistory')
-      .add('ViewGuildInsights')
-      .add('ManageWebhooks')
-      .add('ViewPresence')
-      .add('ViewGuildMembers');
+      .add(PermissionsBitField.Flags.ViewChannel)
+      .add(PermissionsBitField.Flags.ReadMessageHistory)
+      .add(PermissionsBitField.Flags.ViewGuildInsights)
+      .add(PermissionsBitField.Flags.ManageWebhooks)
+      .add(PermissionsBitField.Flags.ViewPresence)
+      .add(PermissionsBitField.Flags.ViewGuildMembers);
     
-    return `https://discord.com/api/oauth2/authorize?client_id=${discordClient.user.id}&permissions=${permissions.bitfield}&scope=bot%20applications.commands`;
+    return `https://discord.com/api/oauth2/authorize?client_id=${discordClient.user?.id || process.env.CLIENT_ID}&permissions=${permissions.bitfield}&scope=bot%20applications.commands`;
   }
 };
 
@@ -200,7 +200,6 @@ class WebSocketManager {
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     const ipHash = createHash('sha256').update(ip).digest('hex').substring(0, 8);
     
-    // Update connection stats
     dataStores.connectionStats.totalConnections++;
     dataStores.connectionStats.activeConnections++;
     if (dataStores.connectionStats.activeConnections > dataStores.connectionStats.peakConnections) {
@@ -209,7 +208,6 @@ class WebSocketManager {
     
     console.log(`[${connectionId}] New connection from ${ipHash}`);
     
-    // Rate limiting
     if (!this.checkRateLimit(ipHash)) {
       ws.send(JSON.stringify({
         type: 'error',
@@ -220,7 +218,6 @@ class WebSocketManager {
       return;
     }
     
-    // Heartbeat
     let isAlive = true;
     const heartbeatInterval = setInterval(() => {
       if (!isAlive) return ws.terminate();
@@ -357,14 +354,12 @@ class PresenceManager {
   
   async fetchUserPresence(userId) {
     try {
-      // Check cache first
       const cacheKey = `presence_${userId}`;
       const cached = dataStores.userCache.get(cacheKey);
       if (cached && Date.now() - cached.timestamp < config.PRESENCE_UPDATE_INTERVAL) {
         return cached.data;
       }
       
-      // Try Discord client first
       const user = await discordClient.users.fetch(userId).catch(() => null);
       if (user?.presence) {
         const presenceData = this.formatPresenceData(user.presence);
@@ -375,7 +370,6 @@ class PresenceManager {
         return presenceData;
       }
       
-      // Fallback to API with proper permission checks
       try {
         const guild = await this.findUserGuild(userId);
         if (!guild) {
@@ -401,7 +395,6 @@ class PresenceManager {
         return presenceData;
       } catch (apiError) {
         console.error(`API Error for user ${userId}:`, apiError);
-        // Return minimal offline data if API fails
         return {
           user: { id: userId },
           status: 'offline',
@@ -476,7 +469,6 @@ class UserDataManager {
     };
     
     try {
-      // Get basic user info
       const discordUser = await discordClient.users.fetch(userId).catch(() => null);
       if (discordUser) {
         userData.user = {
@@ -494,7 +486,6 @@ class UserDataManager {
         userData.bannerURL = discordUser.bannerURL({ format: 'png', size: 512 });
         userData.accent_color = discordUser.hexAccentColor;
         
-        // Process user flags (badges)
         if (discordUser.flags) {
           discordUser.flags.toArray().forEach(flag => {
             if (statusConfig.badges[flag]) {
@@ -509,7 +500,6 @@ class UserDataManager {
         }
       }
 
-      // Get profile data if we have permissions
       try {
         const guild = await presenceManager.findUserGuild(userId);
         if (guild && utils.checkPermissions(guild)) {
@@ -531,7 +521,6 @@ class UserDataManager {
         console.error(`Profile fetch error for ${userId}:`, profileError);
       }
 
-      // Add presence info
       if (presenceData) {
         userData.status = presenceData.status || 'offline';
         userData.activities = presenceData.activities || [];
@@ -551,7 +540,6 @@ class UserDataManager {
         });
       }
       
-      // Cache the data
       dataStores.userCache.set(cacheKey, {
         timestamp: Date.now(),
         data: userData
@@ -576,7 +564,6 @@ class SubscriptionManager {
         throw new Error('Invalid User ID format');
       }
       
-      // Check cache first
       const cacheKey = `user_${userId}`;
       const cached = dataStores.userCache.get(cacheKey);
       if (cached && Date.now() - cached.timestamp < config.CACHE_EXPIRATION) {
@@ -589,7 +576,6 @@ class SubscriptionManager {
         return;
       }
       
-      // Verify guild membership and permissions
       const guild = await presenceManager.findUserGuild(userId);
       if (!guild) {
         const inviteLink = utils.generateBotInvite();
@@ -601,17 +587,14 @@ class SubscriptionManager {
         throw new Error(`Bot missing required permissions in ${guild.name}. Needed: ${config.REQUIRED_PERMISSIONS.join(', ')}\nInvite bot with correct permissions: ${inviteLink}`);
       }
       
-      // Initialize subscription
       if (!dataStores.userSubscriptions[userId]) {
         dataStores.userSubscriptions[userId] = new Set();
       }
       dataStores.userSubscriptions[userId].add(ws);
       
-      // Fetch data
       const presence = await presenceManager.fetchUserPresence(userId);
       const fullData = await userDataManager.getFullUserData(userId, presence);
       
-      // Cache and send
       dataStores.userCache.set(cacheKey, {
         timestamp: Date.now(),
         data: fullData
@@ -678,7 +661,6 @@ const webSocketManager = new WebSocketManager(wss);
 
 // Background Tasks
 function startBackgroundTasks() {
-  // Cache cleanup
   setInterval(() => {
     const now = Date.now();
     let cleared = 0;
@@ -695,7 +677,6 @@ function startBackgroundTasks() {
     }
   }, config.CACHE_EXPIRATION);
   
-  // Subscription cleanup
   setInterval(() => {
     let cleaned = 0;
     
@@ -721,7 +702,6 @@ function startBackgroundTasks() {
     }
   }, config.STATUS_CHECK_INTERVAL);
   
-  // Rate limit reset
   setInterval(() => {
     const now = Date.now();
     let reset = 0;
@@ -854,7 +834,6 @@ discordClient.on('ready', () => {
   console.log(`Logged in as ${discordClient.user.tag}`);
   console.log(`Bot is in ${discordClient.guilds.cache.size} servers:`);
   
-  // Verify permissions in each guild
   discordClient.guilds.cache.forEach(guild => {
     const permissions = guild.members.me?.permissions;
     console.log(`- ${guild.name} (${guild.id})`);
