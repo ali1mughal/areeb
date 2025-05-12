@@ -176,8 +176,8 @@ async function getFullUserData(presenceData) {
         }
     }
     
-    // Fetch fresh data if not in cache
-    if (!userCache.has(userId) {
+    // Fetch fresh data if not in cache or cache expired
+    if (!userCache.has(userId) || Date.now() - userCache.get(userId).timestamp >= 300000) {
         try {
             const response = await fetch(`https://discord.com/api/v9/users/${userId}/profile`, {
                 headers: { 
