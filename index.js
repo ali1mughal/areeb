@@ -26,23 +26,13 @@ const config = {
     'ViewPresence',
     'ViewGuildMembers'
   ],
-  intents: [
-                GatewayIntentBits.GuildMembers,
-                GatewayIntentBits.DirectMessages,
-                GatewayIntentBits.Guilds,
-                GatewayIntentBits.GuildVoiceStates,
-                GatewayIntentBits.GuildMessageReactions,
-                GatewayIntentBits.GuildMessages,
-                GatewayIntentBits.DirectMessages,
-                GatewayIntentBits.MessageContent,
-                GatewayIntentBits.GuildInvites,
-                GatewayIntentBits.GuildMembers,
-                GatewayIntentBits.GuildModeration,
-                GatewayIntentBits.GuildMessageReactions,
-                GatewayIntentBits.GuildEmojisAndStickers,
-                GatewayIntentBits.GuildWebhooks,
-                GatewayIntentBits.GuildVoiceStates,
-                GatewayIntentBits.MessageContent,
+  INTENTS: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildPresences,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent
   ]
 };
 
@@ -67,8 +57,7 @@ app.use(limiter);
 
 // Discord Client Setup with all required intents
 const discordClient = new Client({
-  intents: config.REQUIRED_INTENTS,
-  partials: ['USER', 'GUILD_MEMBER', 'PRESENCE'],
+  intents: config.INTENTS,
   presence: {
     status: 'online',
     activities: [{
@@ -81,7 +70,7 @@ const discordClient = new Client({
 // Server Initialization
 const server = app.listen(config.PORT, () => {
   console.log(`Server v${config.VERSION} running on http://localhost:${config.PORT}`);
-  console.log('Required Intents:', config.REQUIRED_INTENTS.map(i => GatewayIntentBits[i]).join(', '));
+  console.log('Required Intents:', config.INTENTS.map(i => GatewayIntentBits[i]).join(', '));
 });
 
 // WebSocket Server
