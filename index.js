@@ -17,7 +17,7 @@ const config = {
   PRESENCE_UPDATE_INTERVAL: 30 * 1000, // 30 seconds
   STATUS_CHECK_INTERVAL: 60 * 1000, // 1 minute
   MAX_CONNECTIONS_PER_IP: 5,
-  VERSION: '1.2.0'
+  VERSION: '1.2.1'
 };
 
 // Initialize Express
@@ -60,13 +60,6 @@ const discordClient = new Client({
 // Server Initialization
 const server = app.listen(config.PORT, () => {
   console.log(`Server v${config.VERSION} running on http://localhost:${config.PORT}`);
-});
-
-// WebSocket Server
-const wss = new WebSocket.Server({ 
-  server,
-  clientTracking: true,
-  maxPayload: 1024 * 1024 // 1MB
 });
 
 // Data Stores
@@ -141,33 +134,33 @@ const utils = {
   getPlatformIcon: (platform) => statusConfig.platformIcons[platform] || statusConfig.platformIcons.mobile
 };
 
-// Discord Client Events
-discordClient.on('ready', () => {
-  console.log(`Bot logged in as ${discordClient.user.tag}`);
-  startBackgroundTasks();
-});
-
-discordClient.on('presenceUpdate', async (oldPresence, newPresence) => {
-  try {
-    const userId = newPresence.userId;
-    if (!userId) return;
-
-    const data = await presenceManager.formatPresenceData(newPresence);
-    presenceManager.updateLastOnlinePlatform(userId, data);
-    
-    if (dataStores.userSubscriptions[userId]) {
-      const fullData = await userDataManager.getFullUserData(userId, data);
-      webSocketManager.broadcastUpdate(userId, fullData);
-    }
-  } catch (error) {
-    console.error('Error in presenceUpdate:', error);
-    dataStores.connectionStats.errors++;
-  }
-});
-
 // WebSocket Manager
-const webSocketManager = {
-  handleConnection: (ws, req) => {
+class WebSocketManager {
+  constructor(wss) {
+    this.wss = wss;
+    this.wss.on('connection', this.handleConnection.bind(this));
+  }
+
+  checkRateLimit(ipHash) {
+    if (!dataStores.rateLimits.has(ipHash)) {
+      dataStores.rateLimits.set(ipHash, { count: 1, lastReset: Date.now() });
+      return true;
+    }
+    
+    const ipData = dataStores.rateLimits.get(ipHash);
+    if (Date.now() - ipData.lastReset > 60000) {
+      ipData.count = 1;
+      ipData.lastReset = Date.now();
+      return true;
+    }
+    
+    if (ipData.count++ >= config.MAX_CONNECTIONS_PER_IP) {
+      return false;
+    }
+    return true;
+  }
+
+  handleConnection(ws, req) {
     const connectionId = uuidv4();
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     const ipHash = createHash('sha256').update(ip).digest('hex').substring(0, 8);
@@ -244,28 +237,9 @@ const webSocketManager = {
       console.error(`[${connectionId}] WebSocket error:`, error);
       dataStores.connectionStats.errors++;
     });
-  },
+  }
   
-  checkRateLimit: (ipHash) => {
-    if (!dataStores.rateLimits.has(ipHash)) {
-      dataStores.rateLimits.set(ipHash, { count: 1, lastReset: Date.now() });
-      return true;
-    }
-    
-    const ipData = dataStores.rateLimits.get(ipHash);
-    if (Date.now() - ipData.lastReset > 60000) {
-      ipData.count = 1;
-      ipData.lastReset = Date.now();
-      return true;
-    }
-    
-    if (ipData.count++ >= config.MAX_CONNECTIONS_PER_IP) {
-      return false;
-    }
-    return true;
-  },
-  
-  broadcastUpdate: (userId, data) => {
+  broadcastUpdate(userId, data) {
     if (!dataStores.userSubscriptions[userId]) return;
     
     const message = JSON.stringify({
@@ -279,9 +253,9 @@ const webSocketManager = {
         ws.send(message, (err) => err && console.error('Send error:', err));
       }
     }
-  },
+  }
   
-  cleanupConnection: (ws) => {
+  cleanupConnection(ws) {
     for (const userId in dataStores.userSubscriptions) {
       if (dataStores.userSubscriptions[userId].has(ws)) {
         dataStores.userSubscriptions[userId].delete(ws);
@@ -290,9 +264,9 @@ const webSocketManager = {
         }
       }
     }
-  },
+  }
   
-  sendConnectionStats: (ws) => {
+  sendConnectionStats(ws) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: 'stats',
@@ -307,11 +281,11 @@ const webSocketManager = {
       }));
     }
   }
-};
+}
 
 // Presence Manager
-const presenceManager = {
-  formatPresenceData: (presence) => {
+class PresenceManager {
+  formatPresenceData(presence) {
     if (!presence) return {
       user: { id: 'unknown' },
       status: 'offline',
@@ -325,9 +299,9 @@ const presenceManager = {
       client_status: presence.clientStatus || {},
       activities: presence.activities || []
     };
-  },
+  }
   
-  updateLastOnlinePlatform: (userId, data) => {
+  updateLastOnlinePlatform(userId, data) {
     if (!userId) return;
     
     if (data.status !== 'offline') {
@@ -344,9 +318,9 @@ const presenceManager = {
         activities: []
       };
     }
-  },
+  }
   
-  fetchUserPresence: async (userId) => {
+  async fetchUserPresence(userId) {
     try {
       // Check cache first
       const cacheKey = `presence_${userId}`;
@@ -407,11 +381,11 @@ const presenceManager = {
       };
     }
   }
-};
+}
 
 // User Data Manager
-const userDataManager = {
-  getFullUserData: async (userId, presenceData) => {
+class UserDataManager {
+  async getFullUserData(userId, presenceData) {
     const cacheKey = `userdata_${userId}`;
     const cached = dataStores.userCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < config.CACHE_EXPIRATION) {
@@ -538,11 +512,11 @@ const userDataManager = {
     
     return userData;
   }
-};
+}
 
 // Subscription Manager
-const subscriptionManager = {
-  handleSubscription: async (ws, data, connectionId) => {
+class SubscriptionManager {
+  async handleSubscription(ws, data, connectionId) {
     try {
       const userId = data.userId;
       
@@ -604,9 +578,9 @@ const subscriptionManager = {
       
       ws.close();
     }
-  },
+  }
   
-  handleUnsubscription: (ws, userId, connectionId) => {
+  handleUnsubscription(ws, userId, connectionId) {
     try {
       if (!userId || !utils.isValidSnowflake(userId)) {
         throw new Error('Invalid User ID');
@@ -635,9 +609,9 @@ const subscriptionManager = {
         message: error.message || 'Unsubscription failed'
       }));
     }
-  },
+  }
   
-  isUserInSharedGuild: async (userId) => {
+  async isUserInSharedGuild(userId) {
     try {
       const guildId = process.env.GUILD_ID;
       
@@ -666,7 +640,17 @@ const subscriptionManager = {
       return false;
     }
   }
-};
+}
+
+// Initialize Managers
+const presenceManager = new PresenceManager();
+const userDataManager = new UserDataManager();
+const subscriptionManager = new SubscriptionManager();
+const webSocketManager = new WebSocketManager(new WebSocket.Server({ 
+  server,
+  clientTracking: true,
+  maxPayload: 1024 * 1024 // 1MB
+}));
 
 // Background Tasks
 function startBackgroundTasks() {
@@ -811,11 +795,11 @@ process.on('uncaughtException', error => {
 process.on('SIGTERM', () => {
   console.log('Shutting down gracefully...');
   
-  wss.clients.forEach(client => {
+  webSocketManager.wss.clients.forEach(client => {
     client.close(1001, 'Server shutdown');
   });
   
-  wss.close(() => {
+  webSocketManager.wss.close(() => {
     server.close(() => {
       discordClient.destroy();
       process.exit(0);
@@ -828,11 +812,12 @@ process.on('SIGTERM', () => {
   }, 10000);
 });
 
-// Initialize WebSocket
-wss.on('connection', webSocketManager.handleConnection);
-
 // Login to Discord
 discordClient.login(process.env.DISCORD_BOT_TOKEN)
+  .then(() => {
+    console.log('Discord client logged in successfully');
+    startBackgroundTasks();
+  })
   .catch(err => {
     console.error('Login failed:', err);
     process.exit(1);
