@@ -7,12 +7,13 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 10000;
 
-// Create Discord client with necessary intents
+// Create Discord client with all necessary intents
 const discordClient = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildPresences,
-        GatewayIntentBits.GuildMembers
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.MessageContent
     ]
 });
 
@@ -40,20 +41,23 @@ const statusColors = {
 };
 
 // Connect to Discord
-discordClient.login(process.env.DISCORD_BOT_TOKEN);
-discordClient.on('ready', () => {
-    console.log(`Discord bot logged in as ${discordClient.user.tag}`);
-});
+discordClient.login(process.env.DISCORD_BOT_TOKEN)
+    .then(() => console.log(`Bot logged in as ${discordClient.user.tag}`))
+    .catch(err => console.error('Login failed:', err));
 
 // Presence update handler
 discordClient.on('presenceUpdate', async (oldPresence, newPresence) => {
-    const userId = newPresence.userId;
-    const data = await formatPresenceData(newPresence);
-    
-    lastOnlinePlatformHandler(userId, data);
-    
-    if (userSubscriptions[userId]) {
-        broadcastUpdate(userId, await getFullUserData(data));
+    try {
+        const userId = newPresence.userId;
+        const data = await formatPresenceData(newPresence);
+        
+        lastOnlinePlatformHandler(userId, data);
+        
+        if (userSubscriptions[userId]) {
+            broadcastUpdate(userId, await getFullUserData(data));
+        }
+    } catch (error) {
+        console.error('Error in presenceUpdate:', error);
     }
 });
 
@@ -86,66 +90,72 @@ wss.on('connection', (ws) => {
 
 // Main functions
 async function handleSubscription(ws, data) {
-    const userId = data.userId;
-    
-    // Validate user ID
-    if (!isValidSnowflake(userId)) {
+    try {
+        const userId = data.userId;
+        
+        if (!isValidSnowflake(userId)) {
+            ws.send(JSON.stringify({
+                type: 'error',
+                code: 400,
+                message: 'Invalid User ID format'
+            }));
+            return ws.close();
+        }
+        
+        if (!await isUserInGuild(userId)) {
+            const inviteLink = process.env.INVITE || 'https://discord.gg/invite';
+            ws.send(JSON.stringify({
+                type: 'error',
+                code: 404,
+                message: `User not in server. Join our server to track: ${inviteLink}`
+            }));
+            return ws.close();
+        }
+        
+        if (!userSubscriptions[userId]) {
+            userSubscriptions[userId] = new Set();
+        }
+        userSubscriptions[userId].add(ws);
+        
+        const presence = await fetchUserPresence(userId);
+        const fullData = await getFullUserData(presence);
         ws.send(JSON.stringify({
-            type: 'error',
-            code: 400,
-            message: 'Invalid User ID format'
+            type: 'initial',
+            data: fullData
         }));
-        return ws.close();
+        
+        console.log(`Subscribed to user ${userId}`);
+    } catch (error) {
+        console.error('Error in handleSubscription:', error);
     }
-    
-    // Check if user is in guild
-    if (!await isUserInGuild(userId)) {
-        const inviteLink = process.env.INVITE || 'https://discord.gg/invite';
-        ws.send(JSON.stringify({
-            type: 'error',
-            code: 404,
-            message: `User not in server. Join our server to track: ${inviteLink}`
-        }));
-        return ws.close();
-    }
-    
-    // Initialize subscription
-    if (!userSubscriptions[userId]) {
-        userSubscriptions[userId] = new Set();
-    }
-    userSubscriptions[userId].add(ws);
-    
-    // Send initial data
-    const presence = await fetchUserPresence(userId);
-    const fullData = await getFullUserData(presence);
-    ws.send(JSON.stringify({
-        type: 'initial',
-        data: fullData
-    }));
-    
-    console.log(`Subscribed to user ${userId}`);
 }
 
 async function fetchUserPresence(userId) {
     try {
-        // Try to get from Discord.js cache first
+        // Try cache first
         const user = discordClient.users.cache.get(userId);
-        if (user && user.presence) {
-            return formatPresenceData(user.presence);
-        }
-        
-        // Fallback to API request if not in cache
-        const response = await fetch(`https://discord.com/api/v9/users/${userId}/profile`, {
+        if (user?.presence) return formatPresenceData(user.presence);
+
+        // Fallback to API
+        const response = await fetch(`https://discord.com/api/v10/users/${userId}`, {
             headers: { 
-                Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` 
+                Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+                'Content-Type': 'application/json'
             }
         });
-        
+
         if (!response.ok) {
-            throw new Error(`API request failed with status ${response.status}`);
+            throw new Error(`API request failed: ${response.status} ${response.statusText}`);
         }
-        
-        return await response.json();
+
+        const data = await response.json();
+        return {
+            user: { id: userId },
+            status: data.status || 'offline',
+            client_status: data.client_status || {},
+            activities: data.activities || []
+        };
+
     } catch (error) {
         console.error(`Error fetching presence for user ${userId}:`, error);
         return {
@@ -168,48 +178,39 @@ async function getFullUserData(presenceData) {
         activities: []
     };
     
-    // Check cache first
-    if (userCache.has(userId)) {
-        const cached = userCache.get(userId);
-        if (Date.now() - cached.timestamp < 300000) { // 5 minute cache
-            userData = { ...userData, ...cached.data };
+    try {
+        // Check cache
+        if (userCache.has(userId)) {
+            const cached = userCache.get(userId);
+            if (Date.now() - cached.timestamp < 300000) {
+                userData = { ...userData, ...cached.data };
+            }
         }
-    }
-    
-    // Fetch fresh data if not in cache or cache expired
-    if (!userCache.has(userId) || Date.now() - userCache.get(userId).timestamp >= 300000) {
-        try {
-            const response = await fetch(`https://discord.com/api/v9/users/${userId}/profile`, {
+        
+        // Fetch fresh data if needed
+        if (!userCache.has(userId) || Date.now() - userCache.get(userId).timestamp >= 300000) {
+            const response = await fetch(`https://discord.com/api/v10/users/${userId}/profile`, {
                 headers: { 
-                    Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` 
+                    Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+                    'Content-Type': 'application/json'
                 }
             });
             
             if (response.ok) {
                 const freshData = await response.json();
-                // Clean up unnecessary data
                 delete freshData.mutual_guilds;
                 delete freshData.guild_badges;
-                
-                // Merge with existing data
                 userData = { ...userData, ...freshData };
                 
-                // Cache the data
                 userCache.set(userId, {
                     data: userData,
                     timestamp: Date.now()
                 });
             }
-        } catch (error) {
-            console.error(`Error fetching full profile for user ${userId}:`, error);
         }
-    }
-    
-    // Add presence information
-    try {
-        const clientStatus = presenceData.client_status || {};
         
-        // Add platform badges
+        // Add presence info
+        const clientStatus = presenceData.client_status || {};
         Object.keys(clientStatus).forEach(platform => {
             const status = clientStatus[platform] || 'offline';
             userData.badges.push({
@@ -226,8 +227,7 @@ async function getFullUserData(presenceData) {
         userData.activities = presenceData.activities || [];
         
     } catch (error) {
-        console.error(`Error processing presence data for user ${userId}:`, error);
-        // Send error to webhook if configured
+        console.error(`Error processing data for user ${userId}:`, error);
         if (process.env.ERROR_WEBHOOK) {
             await sendErrorToWebhook(userId, error);
         }
@@ -247,11 +247,8 @@ function isValidSnowflake(id) {
 
 async function isUserInGuild(userId) {
     try {
-        // Check if user is in any shared guild
         for (const guild of discordClient.guilds.cache.values()) {
-            if (guild.members.cache.has(userId)) {
-                return true;
-            }
+            if (guild.members.cache.has(userId)) return true;
         }
         return false;
     } catch (error) {
@@ -303,8 +300,6 @@ function cleanupConnection(ws) {
     for (const userId in userSubscriptions) {
         if (userSubscriptions[userId].has(ws)) {
             userSubscriptions[userId].delete(ws);
-            
-            // Clean up empty subscriptions
             if (userSubscriptions[userId].size === 0) {
                 delete userSubscriptions[userId];
             }
@@ -334,4 +329,9 @@ async function sendErrorToWebhook(userId, error) {
 // Basic route
 app.get('/', (req, res) => {
     res.send('Discord Presence WebSocket Server is running');
+});
+
+// Error handling
+process.on('unhandledRejection', error => {
+    console.error('Unhandled promise rejection:', error);
 });
